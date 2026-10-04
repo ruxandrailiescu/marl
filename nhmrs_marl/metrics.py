@@ -1,29 +1,60 @@
+"""Metrics, training diagnostics, and seed-aggregation plotting for IPPO / MAPPO.
+
+Split into three groups:
+  - greedy_eval: deterministic-mean rollout producing task metrics
+    (team reward, landmark coverage, collision rate, mean final distance),
+    averaged over several episodes for low-variance curves.
+  - diagnostics utilities: per-update measures logged to tensorboard
+    (gradient norms, policy parameter-/output-space update size, critic
+    output-space update size).
+  - aggregate_and_plot: load per-seed metric files and plot mean +- std bands.
+"""
+
+from __future__ import annotations
+
 import glob
 import os
-import matplotlib.pyplot as plt
+
 import numpy as np
 import torch
 
+import matplotlib
+matplotlib.use("Agg")  # headless-safe backend
+import matplotlib.pyplot as plt
+
+from nhmrs_marl.env import (array_to_action_dict, env_kwargs, make_env,
+                            rewards_to_array, world_obs_array)
+
+# Eval collision test: two agents closer than COLLISION_DIST. AGENT_RADIUS is
+# SimpleSpreadReward's *default* agent_radius; the 'spread' scenario actually
+# builds it with 0.075 (= agent size), so this eval threshold is twice as loose
+# as the reward's collision test. Kept fixed (and independent of reward mode)
+# so collision rates stay comparable with existing results.
+AGENT_RADIUS = 0.15
+COLLISION_DIST = 2.0 * AGENT_RADIUS
+
+
+# =============================================================================
+# Greedy evaluation (task metrics)
+# =============================================================================
 
 @torch.no_grad()
-def greedy_eval(agent, env_factory, adapters, args, device, agent_order,
-                action_low, action_high, n_episodes=5, base_seed=10_000):
+def greedy_eval(agent, args, device, n_episodes=5, base_seed=10_000):
     """Run ``n_episodes`` greedy (deterministic-mean) episodes and average metrics.
 
-    ``env_factory`` builds a fresh env; ``adapters`` is
-    ``(world_obs_array, array_to_action_dict, rewards_to_array)`` from the
-    trainer. Returns per-episode means of:
+    Each episode uses a fresh env built from ``args``. Returns per-episode means of:
       episodic_return (mean per-agent), coverage (fraction of landmarks),
       collision_rate, mean_final_dist, distinct_success.
     """
-    world_obs_array, array_to_action_dict, rewards_to_array = adapters
     N = args.n_agents
-    collision_threshold = 2.0 * 0.15  # 2 * agent_radius used by SimpleSpreadReward
 
     rets, covs, colls, dists, distincts = [], [], [], [], []
     for ep in range(n_episodes):
-        env = env_factory()
+        env = make_env(**env_kwargs(args))
         env.reset(seed=args.seed + base_seed + ep)
+        agent_order = env.possible_agents[:]
+        space = env.action_space(agent_order[0])
+        action_low, action_high = space.low, space.high
         ep_return = 0.0
         collision_steps = 0
 
@@ -37,7 +68,7 @@ def greedy_eval(agent, env_factory, adapters, args, device, agent_order,
             pos = np.array([ag.state.p_pos for ag in env.world.agents])
             d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
             np.fill_diagonal(d, np.inf)
-            if (d < collision_threshold).any():
+            if (d < COLLISION_DIST).any():
                 collision_steps += 1
 
             if all(truncated.values()):
@@ -68,6 +99,10 @@ def greedy_eval(agent, env_factory, adapters, args, device, agent_order,
     }
 
 
+# =============================================================================
+# Training diagnostics
+# =============================================================================
+
 def flat_params(params) -> torch.Tensor:
     """Concatenate a parameter group into one detached vector."""
     return torch.cat([p.detach().reshape(-1) for p in params])
@@ -89,6 +124,56 @@ def gaussian_kl(mean0, logstd0, mean1, logstd1) -> torch.Tensor:
     return ((logstd1 - logstd0) + (var0 + (mean0 - mean1) ** 2) / (2.0 * var1) - 0.5).sum(-1)
 
 
+@torch.no_grad()
+def snapshot_before_update(agent, b_obs, b_critic_in) -> dict:
+    """Policy/critic state on the rollout batch, for measuring the update size."""
+    mean = agent.actor_mean(b_obs)
+    return {
+        "actor_flat": flat_params(agent.actor_params()),
+        "mean": mean,
+        "logstd": agent.actor_logstd.expand_as(mean),
+        "value": agent.get_value(b_critic_in).flatten(),
+    }
+
+
+@torch.no_grad()
+def update_sizes(agent, before: dict, b_obs, b_critic_in) -> dict:
+    """Size of the last update in parameter space and in policy/critic output space."""
+    new_mean = agent.actor_mean(b_obs)
+    new_logstd = agent.actor_logstd.expand_as(new_mean)
+    return {
+        "policy_output_kl": gaussian_kl(before["mean"], before["logstd"], new_mean, new_logstd).mean().item(),
+        "policy_param_update": (flat_params(agent.actor_params()) - before["actor_flat"]).norm().item(),
+        "critic_output_update": (agent.get_value(b_critic_in).flatten() - before["value"]).pow(2).mean().sqrt().item(),
+    }
+
+
+# =============================================================================
+# Seed aggregation + plotting
+# =============================================================================
+
+def plot_episode_returns(steps, returns, out_path, title, window: int = 20):
+    """One seed's raw episode returns plus a moving average."""
+    if not steps:
+        return
+    steps = np.array(steps)
+    returns = np.array(returns)
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(steps, returns, alpha=0.3, color="tab:blue", label="episode return")
+    if len(returns) >= window:
+        smoothed = np.convolve(returns, np.ones(window) / window, mode="valid")
+        plt.plot(steps[window - 1:], smoothed, color="tab:blue",
+                 label=f"moving avg ({window} ep)")
+    plt.xlabel("Timesteps")
+    plt.ylabel("Episodic return (mean per-agent)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+
 def save_seed_metrics(config_dir, seed, steps, series: dict, extra: dict | None = None):
     """Persist one seed's curves to ``config_dir/seed_<seed>.npz``.
 
@@ -104,7 +189,7 @@ def save_seed_metrics(config_dir, seed, steps, series: dict, extra: dict | None 
     np.savez(os.path.join(config_dir, f"seed_{seed}.npz"), **arrays)
 
 
-def aggregate_and_plot(config_dir, out_dir=None):
+def aggregate_and_plot(config_dir, out_dir=None, algo="IPPO"):
     """Load all ``seed_*.npz`` in ``config_dir`` and plot mean +- std bands.
 
     Produces one PNG per metric. Convergence value (mean of last 10% of points)
@@ -147,18 +232,18 @@ def aggregate_and_plot(config_dir, out_dir=None):
 
         plt.xlabel("Timesteps")
         plt.ylabel(ylabel)
-        plt.title(f"IPPO {os.path.basename(os.path.normpath(config_dir))} (n={n_seeds})")
+        plt.title(f"{algo} {os.path.basename(os.path.normpath(config_dir))} (n={n_seeds})")
         plt.legend()
         plt.grid(alpha=0.3)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, fname), dpi=300)
         plt.close()
 
-    plot_train_returns(config_dir, out_dir, data)
+    plot_train_returns(config_dir, out_dir, data, algo=algo)
     print(f"saved aggregate plots to {out_dir} ({n_seeds} seeds)")
 
 
-def plot_train_returns(config_dir, out_dir=None, data=None):
+def plot_train_returns(config_dir, out_dir=None, data=None, algo="IPPO"):
     """Aggregate the per-iteration training-return curves across seeds.
 
     Episodes are fixed-length (num_steps == max_steps), so every seed records
@@ -184,7 +269,7 @@ def plot_train_returns(config_dir, out_dir=None, data=None):
     plt.fill_between(steps, mean - std, mean + std, color="tab:blue", alpha=0.2, label="±1 std")
     plt.xlabel("Timesteps")
     plt.ylabel("Episodic return (mean per-agent)")
-    plt.title(f"IPPO {os.path.basename(os.path.normpath(config_dir))} (n={n_seeds})")
+    plt.title(f"{algo} {os.path.basename(os.path.normpath(config_dir))} (n={n_seeds})")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -238,31 +323,10 @@ def compare_configs(config_dirs, out_dir, labels=None):
             continue
         plt.xlabel("Timesteps")
         plt.ylabel(ylabel)
-        plt.title("IPPO config comparison")
+        plt.title("Config comparison")
         plt.legend()
         plt.grid(alpha=0.3)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, fname), dpi=300)
         plt.close()
     print(f"saved comparison plots to {out_dir}")
-
-
-def save_plot(hist_steps, hist_return, run_dir, plot_name, args, window: int = 20):
-    if not hist_steps:
-        return
-    steps = np.array(hist_steps)
-    returns = np.array(hist_return)
-    plt.figure(figsize=(7, 4.5))
-    plt.plot(steps, returns, alpha=0.3, color="tab:blue", label="episode return")
-    if len(returns) >= window:
-        smoothed = np.convolve(returns, np.ones(window) / window, mode="valid")
-        plt.plot(steps[window - 1:], smoothed, color="tab:blue",
-                    label=f"moving avg ({window} ep)")
-    plt.xlabel("Timesteps")
-    plt.ylabel("Episodic return (mean per-agent)")
-    plt.title(f"IPPO on simple_assignment_v0 ({args.reward_mode})")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(run_dir, plot_name), dpi=300)
-    plt.close()

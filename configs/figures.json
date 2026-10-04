@@ -1,0 +1,41 @@
+{
+    "groups": [
+        {
+            "title": "Value normalization",
+            "members": [
+                {"exp_id": 1, "label": "valnorm on"},
+                {"exp_id": 2, "label": "valnorm off"}
+            ]
+        },
+        {
+            "title": "Rollout shape",
+            "members": [
+                {"exp_id": 1, "label": "T=500, envs=4"},
+                {"exp_id": 3, "label": "T=100, envs=25"},
+                {"exp_id": 4, "label": "T=25, envs=128"}
+            ]
+        },
+        {
+            "title": "Minibatches per epoch",
+            "members": [
+                {"exp_id": 5, "label": "mb=1"},
+                {"exp_id": 3, "label": "mb=2"},
+                {"exp_id": 6, "label": "mb=4"}
+            ]
+        },
+        {
+            "title": "IPPO vs MAPPO",
+            "members": [
+                {"exp_id": 3, "label": "IPPO"},
+                {"exp_id": 7, "label": "MAPPO"}
+            ]
+        },
+        {
+            "title": "Spread vs Simple",
+            "members": [
+                {"exp_id": 7, "label": "Spread"},
+                {"exp_id": 8, "label": "Simple", "color": "green"}
+            ]
+        }
+    ]
+}

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nhmrs_marl"
+version = "0.1.0"
+description = "Parameter-shared IPPO / MAPPO for the NHMRS simple_assignment_v0 environment"
+requires-python = ">=3.10"
+# nhmrs is not on PyPI: install it from its own repo first (pip install -e ../nhmrs)
+dependencies = [
+    "numpy",
+    "torch",
+    "matplotlib",
+    "tensorboard",
+    "pettingzoo",
+]
+
+[project.optional-dependencies]
+video = ["imageio", "imageio-ffmpeg"]
+
+[tool.setuptools.packages.find]
+include = ["nhmrs_marl*"]
